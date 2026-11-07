@@ -1,0 +1,21 @@
+{
+  "manifest_version": 2,
+  "name": "OverAll Uploader Reply Bridge",
+  "version": "1.0.0",
+  "description": "เชื่อมแอป OverAll Uploader กับ Thunderbird ให้เปิด Reply จริงบน thread เดิมได้ (แทนการเปิดฉบับร่างใหม่)",
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "reply-bridge@example.local",
+      "strict_min_version": "115.0"
+    }
+  },
+  "permissions": [
+    "compose",
+    "messagesRead",
+    "accountsRead",
+    "nativeMessaging"
+  ],
+  "background": {
+    "scripts": ["background.js"]
+  }
+}

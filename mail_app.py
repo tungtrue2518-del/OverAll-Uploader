@@ -1,0 +1,1922 @@
+import base64
+import csv
+import datetime
+import html
+import io
+import json
+import os
+import re
+import shutil
+import struct
+import subprocess
+import sys
+import threading
+import time
+import uuid
+
+import webview
+from webview import FileDialog
+
+if getattr(sys, "frozen", False):
+    APP_DIR = os.path.dirname(sys.executable)
+    RESOURCE_DIR = sys._MEIPASS
+else:
+    APP_DIR = os.path.dirname(os.path.abspath(__file__))
+    RESOURCE_DIR = APP_DIR
+
+CATEGORIES_FILE = os.path.join(APP_DIR, "categories.json")
+SEND_LOG_FILE = os.path.join(APP_DIR, "send_log.json")
+CONFIG_FILE = os.path.join(APP_DIR, "config.json")
+STEP3_RENAME_LOG_FILE = os.path.join(APP_DIR, "step3_rename_log.json")
+STEP3_SEEN_FILE = os.path.join(APP_DIR, "step3_seen.json")
+PENDING_OUTLOOK_SENDS_FILE = os.path.join(APP_DIR, "pending_outlook_sends.json")
+
+APP_VERSION = "3.0.0"
+APP_BUILD_DATE = "2026-07-16"
+
+EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+THUNDERBIRD_CANDIDATES = [
+    r"C:\Program Files\Mozilla Thunderbird\thunderbird.exe",
+    r"C:\Program Files (x86)\Mozilla Thunderbird\thunderbird.exe",
+]
+
+
+def find_thunderbird() -> str:
+    for path in THUNDERBIRD_CANDIDATES:
+        if os.path.isfile(path):
+            return path
+    found = shutil.which("thunderbird")
+    if found:
+        return found
+    raise FileNotFoundError("ไม่พบโปรแกรม Thunderbird ในเครื่องนี้")
+
+
+DEFAULT_CONFIG = {
+    "vendor_root": os.path.join(os.path.expanduser("~"), "Documents", "Quotations"),
+    "vendor_to": "sales@vendor.example.com",
+    "vendor_cc": "purchasing@example.com, it@example.com",
+    # Per-machine digital signature — deliberately editable in Settings, not
+    # hardcoded per-person in source, since this app runs under whichever IT
+    # staff member's Windows session is active. These defaults are
+    # placeholders - set your own in Settings.
+    "sig_name": "Your Name",
+    "sig_position": "IT SUPPORT STAFF",
+    "sig_email": "it@example.com",
+    "sig_it_call": "123",
+}
+
+
+def load_config() -> dict:
+    if not os.path.isfile(CONFIG_FILE):
+        return dict(DEFAULT_CONFIG)
+    try:
+        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        merged = dict(DEFAULT_CONFIG)
+        merged.update({k: v for k, v in data.items() if v})
+        return merged
+    except Exception:
+        return dict(DEFAULT_CONFIG)
+
+
+def save_config(data: dict) -> None:
+    """Merges into the existing saved config instead of replacing it
+    wholesale — otherwise saving the Vendor settings would wipe out a
+    separately-saved signature (and vice versa), since each caller only
+    passes the subset of fields it owns."""
+    existing = {}
+    if os.path.isfile(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                existing = json.load(f)
+        except Exception:
+            existing = {}
+        try:
+            shutil.copyfile(CONFIG_FILE, CONFIG_FILE + ".bak")
+        except Exception:
+            pass
+    existing.update(data)
+    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+        json.dump(existing, f, ensure_ascii=False, indent=2)
+
+
+def vendor_root() -> str:
+    return load_config()["vendor_root"]
+
+
+def vendor_to() -> str:
+    return load_config()["vendor_to"]
+
+
+def vendor_cc() -> str:
+    return load_config()["vendor_cc"]
+
+
+def folder_step1() -> str:
+    return os.path.join(vendor_root(), "ใบเสนอราคาขั้น 1")
+
+
+def folder_step3() -> str:
+    return os.path.join(vendor_root(), "ใบเสนอราคาขั้น 3")
+
+
+def signature_config() -> dict:
+    cfg = load_config()
+    return {
+        "sig_name": cfg.get("sig_name", ""),
+        "sig_position": cfg.get("sig_position", ""),
+        "sig_email": cfg.get("sig_email", ""),
+        "sig_it_call": cfg.get("sig_it_call", ""),
+    }
+
+
+def build_signature_html(cfg: dict | None = None) -> str:
+    """Renders the little name-card signature (bold name / blue role /
+    "Email:" + bold link / boxed "IT Call" number) the user asked to match
+    from their screenshot. Returns "" if no name is configured, so callers
+    can treat an empty string as "no signature to add"."""
+    cfg = cfg or signature_config()
+    name = (cfg.get("sig_name") or "").strip()
+    if not name:
+        return ""
+    position = (cfg.get("sig_position") or "").strip()
+    email = (cfg.get("sig_email") or "").strip()
+    it_call = (cfg.get("sig_it_call") or "").strip()
+
+    rows = [f'<div style="font-weight:700;font-size:14px;color:#1c2b3a;">{html.escape(name)}</div>']
+    if position:
+        rows.append(
+            f'<div style="font-weight:600;font-size:12px;color:#3a6f96;letter-spacing:0.03em;margin:2px 0 8px;">{html.escape(position)}</div>'
+        )
+    if email:
+        rows.append(
+            '<div style="font-size:12px;color:#5a6b7d;margin-bottom:4px;">Email: '
+            f'<a href="mailto:{html.escape(email)}" style="color:#1a56db;font-weight:700;text-decoration:none;">{html.escape(email)}</a></div>'
+        )
+    if it_call:
+        rows.append(
+            '<div style="font-size:12px;color:#5a6b7d;">IT Call '
+            f'<span style="display:inline-block;border:1px solid #c9d3e6;border-radius:4px;padding:1px 8px;font-weight:700;color:#1c2b3a;margin-left:4px;">{html.escape(it_call)}</span></div>'
+        )
+
+    return (
+        "<table cellpadding=\"0\" cellspacing=\"0\" style=\"border-collapse:collapse;font-family:'Leelawadee UI','Segoe UI',Tahoma,Arial,sans-serif;margin-top:12px;\">"
+        '<tr><td style="border-left:3px solid #3a6f96;padding:4px 0 4px 12px;">' + "".join(rows) + "</td></tr></table>"
+    )
+
+PO_NUMBER_RE = re.compile(r"(PO-QC\d+)", re.IGNORECASE)
+QUOTE_NUMBER_RE = re.compile(r"(Q\d{6,})", re.IGNORECASE)
+
+PR_PO_ARCHIVE_ROOT = os.environ.get("PO_ARCHIVE_ROOT", r"\\fileserver\IT\PO-Archive")
+MONTH_ABBR = ["", "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+MONTH_FULL = ["", "January", "February", "March", "April", "May", "June", "July",
+              "August", "September", "October", "November", "December"]
+
+
+def resolve_archive_month_dir(year_dir: str, month: int) -> str:
+    """The real PO archive share was built by hand over the
+    years and its month-folder naming is inconsistent (most months are the
+    3-letter abbreviation, but June/July have been spelled out in full in
+    more than one year folder). Rather than guess and risk creating a THIRD
+    variant, prefer whichever name already exists on disk for this year;
+    only fall back to the 3-letter abbreviation (the majority convention)
+    when creating a month folder for the first time."""
+    abbr_path = os.path.join(year_dir, MONTH_ABBR[month])
+    full_path = os.path.join(year_dir, MONTH_FULL[month])
+    if os.path.isdir(full_path):
+        return full_path
+    return abbr_path
+
+
+def archive_pr_po_file(file_path: str, po_no: str) -> dict:
+    """After step 2 (อนุมัติ+จัดส่ง) opens a draft, COPY the PDF into the
+    shared PO-Archive archive, renamed to just the PO number. Never raises —
+    callers treat archiving as best-effort so a network hiccup doesn't undo
+    an already-sent email.
+
+    Year is the plain calendar (ค.ศ.) year, matching the real folder names
+    on the share (2023/2024/2025/2026/...) — an earlier version used the
+    Buddhist Era year (+543, e.g. "2569") which doesn't match anything on
+    disk and created a stray duplicate year folder. That folder's contents
+    were manually merged back into the correct 2026\\July on 2026-07-23;
+    don't reintroduce the +543 offset here.
+
+    Was originally a MOVE, but that broke the still-open Thunderbird draft:
+    this runs ~2s after the draft opens (see open_step2), not after the user
+    actually clicks Send, so moving the file out from under the draft made
+    the attachment un-previewable ("File not found") if the user checked it
+    before sending — confirmed live when a real file had already been
+    relocated to the archive while its compose window was still open.
+    Copying leaves the original in the working folder for as long as the
+    user needs it; nothing auto-cleans that folder anymore."""
+    if not po_no:
+        return {"ok": False, "message": "ไม่ได้คัดลอกไฟล์เข้า PO-Archive เพราะไม่พบเลข PO-QC สำหรับตั้งชื่อไฟล์"}
+    if not file_path or not os.path.isfile(file_path):
+        return {"ok": False, "message": "ไม่ได้คัดลอกไฟล์เข้า PO-Archive เพราะไม่พบไฟล์ต้นทาง"}
+
+    today = datetime.date.today()
+    year_dir = os.path.join(PR_PO_ARCHIVE_ROOT, str(today.year))
+    dest_dir = resolve_archive_month_dir(year_dir, today.month)
+    ext = os.path.splitext(file_path)[1] or ".pdf"
+    dest_path = os.path.join(dest_dir, f"{po_no}{ext}")
+
+    try:
+        os.makedirs(dest_dir, exist_ok=True)
+        shutil.copy2(file_path, dest_path)
+        shown = os.path.relpath(dest_path, PR_PO_ARCHIVE_ROOT)
+        return {"ok": True, "message": f"คัดลอกไฟล์เข้า PO-Archive แล้ว: {shown}"}
+    except Exception as exc:
+        return {"ok": False, "message": f"ส่งอีเมลสำเร็จ แต่คัดลอกไฟล์เข้า PO-Archive ไม่สำเร็จ: {exc}"}
+
+# ---------------------------------------------------------------------------
+# FG Stock Uploader status tab: this is a SEPARATE standalone tool (its own
+# folder, its own venv-independent pymysql dependency, its own Scheduled
+# Task) that OverAll Uploader does not run or own — it just reads that tool's
+# log/marker files and can trigger a manual run via its own launcher .bat.
+# Folder comes from the FG_STOCK_DIR environment variable.
+# ---------------------------------------------------------------------------
+FG_STOCK_DIR = os.environ.get("FG_STOCK_DIR", os.path.join(os.path.expanduser("~"), "Auto FG Stock Importer"))
+FG_STOCK_LOG_FILE = os.path.join(FG_STOCK_DIR, "run_log.txt")
+FG_STOCK_LAST_SUCCESS_FILE = os.path.join(FG_STOCK_DIR, "last_success.txt")
+FG_STOCK_LAUNCHER = os.path.join(FG_STOCK_DIR, "run_export.bat")
+FG_STOCK_CONFIG_FILE = os.path.join(FG_STOCK_DIR, "config.json")
+FG_STOCK_TASK_NAME = "Auto FG Stock Importer"
+FG_STOCK_STARTUP_SHORTCUT = os.path.join(
+    os.environ.get("APPDATA", ""), "Microsoft", "Windows", "Start Menu", "Programs", "Startup",
+    "Auto FG Stock Importer.lnk",
+)
+# Must stay identical to MONTH_FOLDER in auto_fg_stock.py — duplicated here
+# rather than imported since the two tools are deliberately independent
+# (see the block comment above).
+FG_STOCK_MONTH_FOLDER = [
+    "", "01-Jan", "02-Feb", "03-Mar", "04-April", "05-May", "06-Jun",
+    "07-Jul", "08-Aug", "09-Sep", "10-Oct", "11-Nov", "12-Dec",
+]
+
+
+def fg_stock_today_folder() -> str | None:
+    if not os.path.isfile(FG_STOCK_CONFIG_FILE):
+        return None
+    try:
+        with open(FG_STOCK_CONFIG_FILE, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+        dest_root = cfg["dest_root"]
+    except Exception:
+        return None
+    today = datetime.date.today()
+    return os.path.join(dest_root, str(today.year), FG_STOCK_MONTH_FOLDER[today.month])
+
+
+def fg_stock_task_info() -> dict:
+    try:
+        result = subprocess.run(
+            ["schtasks", "/query", "/tn", FG_STOCK_TASK_NAME, "/fo", "LIST", "/v"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode != 0:
+            return {"registered": False}
+        info = {}
+        for line in result.stdout.splitlines():
+            if ":" in line:
+                key, _, value = line.partition(":")
+                info[key.strip()] = value.strip()
+        return {
+            "registered": True,
+            "next_run": info.get("Next Run Time", "-"),
+            "last_run": info.get("Last Run Time", "-"),
+            "last_result": info.get("Last Result", "-"),
+        }
+    except Exception:
+        return {"registered": False}
+
+
+SIGNATURE = (
+    "ขอแสดงความนับถือ\n"
+    "Your Name\n"
+    "IT Support Staff\n\n"
+    "Example Company Co., Ltd.\n"
+    "123 Example Road, Bangkok 10000\n"
+    "Tel: 02-000-0000"
+)
+
+THAI_WEEKDAYS = ["วันจันทร์", "วันอังคาร", "วันพุธ", "วันพฤหัสบดี", "วันศุกร์", "วันเสาร์", "วันอาทิตย์"]
+THAI_MONTHS = [
+    "", "มกราคม", "กุมภาพันธ์", "มีนาคม", "เมษายน", "พฤษภาคม", "มิถุนายน",
+    "กรกฎาคม", "สิงหาคม", "กันยายน", "ตุลาคม", "พฤศจิกายน", "ธันวาคม",
+]
+
+
+def thai_date(d: datetime.date) -> str:
+    weekday = THAI_WEEKDAYS[d.weekday()]
+    return f"{weekday} ที่ {d.day} {THAI_MONTHS[d.month]} {d.year + 543}"
+
+
+def next_business_day(d: datetime.date) -> datetime.date:
+    n = d + datetime.timedelta(days=1)
+    while n.weekday() >= 5:  # Sat=5, Sun=6
+        n += datetime.timedelta(days=1)
+    return n
+
+
+def default_standby_subject() -> str:
+    return f"แจ้งเรื่องการ Standby เจ้าหน้าที่ IT {thai_date(datetime.date.today())}"
+
+
+def standby_cutoff_time(now: datetime.datetime | None = None) -> datetime.datetime:
+    """The Standby cutoff is always a half-hour mark (17:00, 17:30, 18:00, ...),
+    rounded up to the next half-hour from the current time — but never earlier
+    than 17:00, since standby coverage starts at end of the normal workday.
+    e.g. sent at 17:05 -> 17:30 cutoff; sent at 17:30 exactly -> stays 17:30;
+    sent at 18:31 -> 19:00 cutoff; sent at 15:00 -> stays at the 17:00 floor."""
+    now = now or datetime.datetime.now()
+    floor = now.replace(hour=17, minute=0, second=0, microsecond=0)
+    if now <= floor:
+        return floor
+    steps_of_30min = -(-int((now - floor).total_seconds() // 60) // 30)  # ceil division
+    return floor + datetime.timedelta(minutes=30 * steps_of_30min)
+
+
+def default_general_body() -> str:
+    today = datetime.date.today()
+    tomorrow = next_business_day(today)
+    cutoff = standby_cutoff_time()
+    cutoff_display = cutoff.strftime("%H:%M")
+    return (
+        "เรียน ทุกหน่วยงานที่เกี่ยวข้อง\n\n"
+        f"เนื่องจากเจ้าหน้าที่ IT มีภารกิจส่วนตัว จึงไม่สามารถอยู่ Standby หลังช่วงเวลา {cutoff_display} น. "
+        f"ของวันนี้ ({thai_date(today)}) ได้ ดังนั้น สำหรับพื้นที่การทำงานที่มีการเปิด OT จนถึงเวลา 21:00 น. "
+        "หากพบปัญหาในการใช้งานอุปกรณ์คอมพิวเตอร์, Server หรือ Printer ท่านสามารถเขียนโน้ตแจ้งเรื่องไว้ที่โต๊ะแผนก IT ได้ทันทีครับ "
+        f"เจ้าหน้าที่จะรีบเข้าดำเนินการแก้ไขให้ใน ({thai_date(tomorrow)})\n\n"
+        "กรณีพบปัญหาเร่งด่วนที่มีผลกระทบต่อการทำงาน จนไม่สามารถปฏิบัติงานต่อได้ สามารถติดต่อเจ้าหน้าที่ได้ที่เบอร์โทรศัพท์ด้านล่างนี้ครับ:\n\n"
+        "- IT Staff A: 080-000-0001\n"
+        "- IT Staff B: 080-000-0002\n"
+        "- IT Staff C: 080-000-0003\n\n"
+        "จึงเรียนมาเพื่อโปรดทราบและขออภัยในความไม่สะดวกครับ"
+    )
+
+
+def step1_body(quote_no: str) -> str:
+    quote_display = quote_no.strip() or "___________"
+    return (
+        "เรียน ทีมงาน Vendor\n\n"
+        f"ผมขอความกรุณาจัดทำใบเสนอราคา หมายเลข [{quote_display}] ตามรายการที่แนบมาพร้อมอีเมลฉบับนี้\n\n"
+        "รหัสลูกค้า: 00000000\n"
+        "ชื่อบริษัท: Example Company Co., Ltd.\n\n"
+        "หากต้องการข้อมูลเพิ่มเติม หรือต้องการสอบถามรายละเอียดใด ๆ เพิ่มเติม ทาง Vendor สามารถติดต่อผมได้ตามข้อมูลด้านล่าง\n\n"
+        "ขอขอบพระคุณล่วงหน้าสำหรับความกรุณาและการสนับสนุนครับ\n\n"
+        "--\n" + SIGNATURE
+    )
+
+
+def step2_body(po_no: str) -> str:
+    po_display = po_no.strip() or "___________"
+    return (
+        "เรียนแอดมินฝ่ายขาย Vendor\n\n"
+        f"ใบเสนอราคา [{po_display}] ได้รับการอนุมัติเรียบร้อยแล้วครับ\n"
+        "เอกสารอนุมัติแนบมาพร้อมอีเมลฉบับนี้\n\n"
+        "ขอความกรุณาจัดส่งสินค้าตามที่อยู่ด้านล่าง:\n\n"
+        "Example Company Co., Ltd.\n"
+        "123 Example Road\n"
+        "Bangkok 10000\n\n"
+        "เบอร์ติดต่อ:\n\n"
+        "   02-000-0000\n\n"
+        "   080-000-0001 IT Staff A\n\n"
+        "   080-000-0002 IT Staff B\n\n\n"
+        "เวลารับสินค้า: วันจันทร์ - วันเสาร์ เวลา 08:00 - 17:00 น.\n\n"
+        "ขอขอบพระคุณสำหรับการบริการครับ\n"
+        "ขอแสดงความนับถือ"
+    )
+
+
+def latest_pdf(folder: str) -> str | None:
+    try:
+        candidates = [
+            os.path.join(folder, name)
+            for name in os.listdir(folder)
+            if name.lower().endswith(".pdf")
+        ]
+    except FileNotFoundError:
+        return None
+    if not candidates:
+        return None
+    return max(candidates, key=os.path.getmtime)
+
+
+def extract_pdf_text(path: str, max_pages: int = 2) -> str:
+    """Best-effort text extraction from the first few pages of a PDF.
+    Returns "" (not an exception) if PyMuPDF is missing or the file can't be read,
+    so callers can always fall back to filename-only matching."""
+    try:
+        import fitz  # PyMuPDF
+    except ImportError:
+        return ""
+    try:
+        parts = []
+        with fitz.open(path) as doc:
+            for i, page in enumerate(doc):
+                if i >= max_pages:
+                    break
+                parts.append(page.get_text())
+        return "\n".join(parts)
+    except Exception:
+        return ""
+
+
+def find_number_in_file(path: str, pattern: "re.Pattern") -> str:
+    """Search the filename first (cheap), then fall back to the PDF's own text
+    content — the number IT staff care about often isn't in the filename at all,
+    e.g. a generic "EXT HDD 3.5.pdf" that has the quote number printed inside it."""
+    match = pattern.search(os.path.basename(path))
+    if match:
+        return match.group(1)
+    match = pattern.search(extract_pdf_text(path))
+    return match.group(1) if match else ""
+
+
+# ---------------------------------------------------------------------------
+# Step-3 folder auto-rename (OCR)
+# ---------------------------------------------------------------------------
+# The ใบเสนอราคาขั้น 3 PDFs are SCANNED IMAGES — they have no text layer, so
+# extract_pdf_text() returns "" for every one of them and the quotation
+# number ("No. : QC<digits>" in the top-right Information box) can only be
+# read by OCR. A background watcher (see run_tray_and_watcher) renames each
+# new/changed PDF to PO-QC<digits>.pdf based on that OCR'd number. This
+# reuses the Tesseract install already on this machine via pytesseract; the
+# tesseract.exe binary is NOT bundled into the exe, so another machine
+# without Tesseract simply gets the feature disabled (read_qc returns "").
+TESSERACT_CANDIDATES = [
+    r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+    r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+]
+# Captures the digits after a "QC" token, tolerating OCR separators/spaces
+# (e.g. "No. : QC 69012345" / "QC:69012345"). 6-10 digits: numbers here
+# are QC + BE-year "69" + a 4-6 digit running number (e.g. QC6901234 .. QC69012345).
+QC_OCR_RE = re.compile(r"QC[\s:.\-]*?(\d{6,10})", re.IGNORECASE)
+
+
+def tesseract_path() -> str | None:
+    for p in TESSERACT_CANDIDATES:
+        if os.path.isfile(p):
+            return p
+    return shutil.which("tesseract")
+
+
+def _qc_candidates(ocr_text: str) -> list:
+    return ["QC" + digits for digits in QC_OCR_RE.findall(ocr_text or "")]
+
+
+def read_qc_number_from_pdf(path: str) -> str:
+    """OCR the quotation number ('No. : QC<digits>') off a scanned step-3 PDF.
+    Returns 'QC<digits>' or '' if it can't be read confidently. Never raises.
+
+    Safety: only returns a number when the OCR of the top-right crop yields
+    exactly ONE distinct QC value — any ambiguity (0 matches, or 2+ different
+    matches) returns '' so the caller leaves the file untouched rather than
+    risk an auto-rename to the wrong number."""
+    tess = tesseract_path()
+    if not tess:
+        return ""
+    try:
+        import fitz  # PyMuPDF
+        import pytesseract
+        from PIL import Image
+    except Exception:
+        return ""
+    try:
+        pytesseract.pytesseract.tesseract_cmd = tess
+        with fitz.open(path) as doc:
+            if doc.page_count < 1:
+                return ""
+            pix = doc[0].get_pixmap(matrix=fitz.Matrix(3, 3))  # 3x DPI for legible OCR
+            img = Image.open(io.BytesIO(pix.tobytes("png")))
+        w, h = img.size
+        # "No. : QC..." sits in the top-right Information box — cropping there
+        # is both faster and less error-prone than OCR'ing the whole page.
+        crop = img.crop((int(w * 0.5), 0, w, int(h * 0.32)))
+        candidates = _qc_candidates(pytesseract.image_to_string(crop))
+        if not candidates:
+            # layout shifted? one full-page retry before giving up
+            candidates = _qc_candidates(pytesseract.image_to_string(img))
+        distinct = set(candidates)
+        return candidates[0] if len(distinct) == 1 else ""
+    except Exception:
+        return ""
+
+
+def step3_target_name(qc_number: str) -> str:
+    return f"PO-{qc_number}.pdf"
+
+
+def process_step3_file(path: str) -> dict:
+    """Read one step-3 PDF's QC number by OCR and rename it to
+    PO-QC<number>.pdf when needed. Deliberately conservative — never
+    overwrites, never deletes, and skips (leaves the file as-is) on every
+    uncertain case:
+      - not a .pdf / file vanished
+      - OCR couldn't read a single confident QC number  -> 'unreadable'
+      - a file with the target name already exists       -> 'collision'
+      - the file is already correctly named              -> 'already_named'
+    Returns a result dict; callers log it."""
+    name = os.path.basename(path)
+    if not name.lower().endswith(".pdf"):
+        return {"action": "skip", "reason": "not_pdf", "file": name}
+    if not os.path.isfile(path):
+        return {"action": "skip", "reason": "missing", "file": name}
+    qc = read_qc_number_from_pdf(path)
+    if not qc:
+        return {"action": "skip", "reason": "unreadable", "file": name}
+    target = step3_target_name(qc)
+    if name == target:
+        return {"action": "already_named", "file": name, "qc": qc}
+    dest = os.path.join(os.path.dirname(path), target)
+    if os.path.exists(dest):
+        return {"action": "skip", "reason": "collision", "file": name, "target": target, "qc": qc}
+    try:
+        os.rename(path, dest)
+        return {"action": "renamed", "file": name, "target": target, "qc": qc}
+    except Exception as exc:
+        return {"action": "error", "file": name, "target": target, "message": str(exc)}
+
+
+def step3_autorename_enabled() -> bool:
+    """Read the on/off flag directly from config.json — NOT via load_config(),
+    whose `if v` truthy-merge would silently drop a stored `False` and revert
+    the toggle to the default-on. Missing key = enabled."""
+    if not os.path.isfile(CONFIG_FILE):
+        return True
+    try:
+        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+            return bool(json.load(f).get("step3_autorename", True))
+    except Exception:
+        return True
+
+
+def append_step3_rename_log(entry: dict) -> None:
+    entry = dict(entry)
+    entry["timestamp"] = datetime.datetime.now().isoformat(timespec="seconds")
+    with _data_lock:
+        logs = load_json_list(STEP3_RENAME_LOG_FILE)
+        logs.insert(0, entry)
+        save_json_list(STEP3_RENAME_LOG_FILE, logs[:200])
+
+
+def sweep_step3_folder(log_all: bool = False) -> dict:
+    """Process every PDF in the step-3 folder once. Used for the startup
+    sweep and the manual 'สแกนเดี๋ยวนี้' button. Returns a summary count.
+    log_all=False logs only actionable outcomes (renamed / collision /
+    error); already-named files are counted but not written to the log."""
+    folder = folder_step3()
+    summary = {"renamed": 0, "already_named": 0, "unreadable": 0, "collision": 0, "error": 0}
+    try:
+        names = sorted(os.listdir(folder))
+    except OSError:
+        return summary
+    for name in names:
+        if not name.lower().endswith(".pdf"):
+            continue
+        result = process_step3_file(os.path.join(folder, name))
+        action = result.get("action")
+        reason = result.get("reason")
+        key = action if action in ("renamed", "already_named", "error") else reason
+        if key in summary:
+            summary[key] += 1
+        if action == "renamed" or reason == "collision" or action == "error" or (log_all and action == "already_named"):
+            append_step3_rename_log(result)
+    return summary
+
+
+def escape_field(value: str) -> str:
+    return value.replace("\\", "\\\\").replace("'", "\\'")
+
+
+_data_lock = threading.Lock()
+
+
+def load_json_list(path: str) -> list:
+    if not os.path.isfile(path):
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+
+def save_json_list(path: str, data: list) -> None:
+    if os.path.isfile(path):
+        try:
+            shutil.copyfile(path, path + ".bak")
+        except Exception:
+            pass
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def load_categories() -> list:
+    return load_json_list(CATEGORIES_FILE)
+
+
+def save_categories(categories: list) -> None:
+    save_json_list(CATEGORIES_FILE, categories)
+
+
+def split_addresses(value: str) -> list:
+    if not value:
+        return []
+    return [p.strip() for p in re.split(r"[;,]", value) if p.strip()]
+
+
+def validate_recipients(to_addr: str, cc_addr: str) -> str | None:
+    bad = [a for a in split_addresses(to_addr) + split_addresses(cc_addr) if not EMAIL_RE.match(a)]
+    if bad:
+        return f"อีเมลไม่ถูกต้อง กรุณาตรวจสอบ: {', '.join(bad)}"
+    return None
+
+
+def append_send_log(entry: dict) -> dict:
+    entry = dict(entry)
+    entry["id"] = uuid.uuid4().hex[:10]
+    entry["timestamp"] = datetime.datetime.now().isoformat(timespec="seconds")
+    with _data_lock:
+        logs = load_json_list(SEND_LOG_FILE)
+        logs.insert(0, entry)
+        logs = logs[:500]
+        save_json_list(SEND_LOG_FILE, logs)
+    return entry
+
+
+def python_executable_for_shortcut() -> str:
+    exe = sys.executable
+    pythonw = os.path.join(os.path.dirname(exe), "pythonw.exe")
+    return pythonw if os.path.isfile(pythonw) else exe
+
+
+def is_outlook_installed() -> bool:
+    try:
+        import winreg
+
+        winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, r"Outlook.Application\CLSID")
+        return True
+    except OSError:
+        return False
+
+
+def startup_shortcut_path() -> str:
+    startup_dir = os.path.join(
+        os.environ.get("APPDATA", ""), "Microsoft", "Windows", "Start Menu", "Programs", "Startup"
+    )
+    return os.path.join(startup_dir, "OverAll Uploader.lnk")
+
+
+# ---------------------------------------------------------------------------
+# Thunderbird "reply bridge": lets open_step2() open a REAL threaded reply to
+# the original Vendor quotation email instead of a brand-new compose window.
+# Thunderbird's -compose CLI has no concept of replying to an existing
+# message, so this uses a small Thunderbird extension (thunderbird_extension/)
+# that talks to a native-messaging host (this process, run with
+# --reply-bridge-host) over a simple JSON job-file queue:
+#   1. open_step2() writes reply_jobs/<id>.json describing the job
+#   2. the native host (a long-lived process Thunderbird itself launches when
+#      the extension's background.js calls connectNative()) notices the file,
+#      forwards it to the extension over native messaging, and waits
+#   3. the extension searches Thunderbird's mail for the original message,
+#      calls the real Compose API's beginReply(), sets body/cc, attaches the
+#      file (sent as base64 to avoid needing file:// permissions), and
+#      reports back
+#   4. the host writes reply_jobs/<id>.result.json; open_step2() polls for it
+#      with a timeout and falls back to the old -compose flow if it never
+#      shows up (extension not installed, Thunderbird not running, etc.)
+# ---------------------------------------------------------------------------
+
+REPLY_BRIDGE_HOST_NAME = "com.example.mail_uploader_reply_bridge"
+REPLY_BRIDGE_EXTENSION_ID = "reply-bridge@example.local"
+REPLY_JOBS_DIR = os.path.join(APP_DIR, "reply_jobs")
+
+
+def reply_bridge_host_manifest_path() -> str:
+    return os.path.join(APP_DIR, "reply_bridge_host_manifest.json")
+
+
+def reply_bridge_launcher_path() -> str:
+    return os.path.join(APP_DIR, "run_reply_bridge_host.bat")
+
+
+def is_reply_bridge_registered() -> bool:
+    try:
+        import winreg
+
+        winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            rf"SOFTWARE\Mozilla\Thunderbird\NativeMessagingHosts\{REPLY_BRIDGE_HOST_NAME}",
+        )
+        return True
+    except OSError:
+        return False
+
+
+def register_reply_bridge() -> dict:
+    """One-time setup: writes the native-messaging host manifest + launcher
+    batch file, and registers the host under HKCU so Thunderbird can find it.
+    Does NOT touch Thunderbird's extension-signature enforcement — that pref
+    (xpinstall.signatures.required) is a browser security setting the user
+    has to flip themselves in about:config; we never modify it for them."""
+    try:
+        pythonw = python_executable_for_shortcut()
+        script = os.path.join(APP_DIR, "mail_app.py")
+        launcher = reply_bridge_launcher_path()
+        with open(launcher, "w", encoding="utf-8") as f:
+            f.write("@echo off\r\n")
+            if getattr(sys, "frozen", False):
+                f.write(f'"{sys.executable}" --reply-bridge-host\r\n')
+            else:
+                f.write(f'"{pythonw}" "{script}" --reply-bridge-host\r\n')
+
+        manifest = {
+            "name": REPLY_BRIDGE_HOST_NAME,
+            "description": "OverAll Uploader reply bridge",
+            "path": launcher,
+            "type": "stdio",
+            "allowed_extensions": [REPLY_BRIDGE_EXTENSION_ID],
+        }
+        manifest_path = reply_bridge_host_manifest_path()
+        with open(manifest_path, "w", encoding="utf-8") as f:
+            json.dump(manifest, f, ensure_ascii=False, indent=2)
+
+        import winreg
+
+        key = winreg.CreateKey(
+            winreg.HKEY_CURRENT_USER,
+            rf"SOFTWARE\Mozilla\Thunderbird\NativeMessagingHosts\{REPLY_BRIDGE_HOST_NAME}",
+        )
+        winreg.SetValue(key, "", winreg.REG_SZ, manifest_path)
+        winreg.CloseKey(key)
+        os.makedirs(REPLY_JOBS_DIR, exist_ok=True)
+        return {"ok": True, "message": "ลงทะเบียน reply bridge แล้ว — ยังต้องติดตั้งส่วนขยายใน Thunderbird เองอีกขั้นตอนหนึ่ง (ดู SKILL.md)"}
+    except Exception as exc:
+        return {"ok": False, "message": f"ลงทะเบียนไม่สำเร็จ: {exc}"}
+
+
+def unregister_reply_bridge() -> dict:
+    try:
+        import winreg
+
+        try:
+            winreg.DeleteKey(
+                winreg.HKEY_CURRENT_USER,
+                rf"SOFTWARE\Mozilla\Thunderbird\NativeMessagingHosts\{REPLY_BRIDGE_HOST_NAME}",
+            )
+        except FileNotFoundError:
+            pass
+        return {"ok": True, "message": "ปิดใช้งาน reply bridge แล้ว"}
+    except Exception as exc:
+        return {"ok": False, "message": f"ปิดใช้งานไม่สำเร็จ: {exc}"}
+
+
+def _reply_bridge_send(message: dict) -> None:
+    encoded = json.dumps(message).encode("utf-8")
+    sys.stdout.buffer.write(struct.pack("<I", len(encoded)))
+    sys.stdout.buffer.write(encoded)
+    sys.stdout.buffer.flush()
+
+
+def _reply_bridge_read() -> dict | None:
+    raw_length = sys.stdin.buffer.read(4)
+    if not raw_length or len(raw_length) < 4:
+        return None
+    length = struct.unpack("<I", raw_length)[0]
+    data = sys.stdin.buffer.read(length)
+    return json.loads(data)
+
+
+def run_reply_bridge_host() -> None:
+    """The native-messaging host process itself. Thunderbird launches this
+    (via run_reply_bridge_host.bat) the moment the extension's background.js
+    calls connectNative(), and keeps it alive as long as that port stays
+    open. Runs until Thunderbird closes the pipe (stdin read returns empty)."""
+    os.makedirs(REPLY_JOBS_DIR, exist_ok=True)
+
+    def watch_jobs():
+        seen = set()
+        while True:
+            try:
+                for name in os.listdir(REPLY_JOBS_DIR):
+                    if not name.endswith(".json") or name.endswith(".result.json") or name in seen:
+                        continue
+                    path = os.path.join(REPLY_JOBS_DIR, name)
+                    try:
+                        with open(path, "r", encoding="utf-8") as f:
+                            job = json.load(f)
+                        _reply_bridge_send(job)
+                        seen.add(name)
+                        os.remove(path)
+                    except Exception:
+                        pass
+            except FileNotFoundError:
+                pass
+            time.sleep(1)
+
+    threading.Thread(target=watch_jobs, daemon=True).start()
+
+    while True:
+        msg = _reply_bridge_read()
+        if msg is None:
+            os._exit(0)
+        job_id = msg.get("jobId")
+        if not job_id:
+            continue
+        result_path = os.path.join(REPLY_JOBS_DIR, f"{job_id}.result.json")
+        try:
+            with open(result_path, "w", encoding="utf-8") as f:
+                json.dump(msg, f, ensure_ascii=False)
+        except Exception:
+            pass
+
+
+def try_bridge_action(
+    search_text: str,
+    cc_addr: str,
+    body: str,
+    attachment_paths: list | None = None,
+    timeout_seconds: float = 15,
+    action: str = "reply",
+) -> dict | None:
+    """Submit a reply/forward job and wait for the extension to handle it.
+    Returns None (never raises) if the bridge isn't registered, Thunderbird
+    isn't running the extension, or nothing answers in time — callers must
+    treat None as "fall back to the normal compose flow". `action` is
+    "reply" or "forward" (see background.js's processJob)."""
+    if not is_reply_bridge_registered():
+        return None
+    try:
+        os.makedirs(REPLY_JOBS_DIR, exist_ok=True)
+        job_id = uuid.uuid4().hex[:12]
+        job = {
+            "jobId": job_id,
+            "action": action,
+            "searchText": search_text,
+            "cc": cc_addr or "",
+            "body": body,
+        }
+        attachments = []
+        for path in attachment_paths or []:
+            if path and os.path.isfile(path):
+                with open(path, "rb") as f:
+                    attachments.append(
+                        {"name": os.path.basename(path), "base64": base64.b64encode(f.read()).decode("ascii")}
+                    )
+        if attachments:
+            job["attachments"] = attachments
+
+        job_path = os.path.join(REPLY_JOBS_DIR, f"{job_id}.json")
+        with open(job_path, "w", encoding="utf-8") as f:
+            json.dump(job, f, ensure_ascii=False)
+
+        result_path = os.path.join(REPLY_JOBS_DIR, f"{job_id}.result.json")
+        deadline = time.time() + timeout_seconds
+        while time.time() < deadline:
+            if os.path.isfile(result_path):
+                try:
+                    with open(result_path, "r", encoding="utf-8") as f:
+                        result = json.load(f)
+                finally:
+                    try:
+                        os.remove(result_path)
+                    except Exception:
+                        pass
+                return result
+            time.sleep(0.4)
+        try:
+            if os.path.isfile(job_path):
+                os.remove(job_path)
+        except Exception:
+            pass
+        return None
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Pending-Outlook-send tracker
+# ---------------------------------------------------------------------------
+# Root cause of a real incident (2026-08-21): the app only ever opens an
+# Outlook draft (mail.Display()) and NEVER sends it — the user must click
+# Send in Outlook itself. If they close/sleep the PC before doing that, the
+# unsent compose window just sits there, invisible, surviving sleep cycles
+# indefinitely (Outlook itself never closes on Sleep) until someone
+# eventually stumbles on it and sends it — days or weeks later, with stale
+# content, to the whole distribution list.
+#
+# This tracks every opened Outlook draft in a small JSON file (not just
+# in-memory) so it survives an app restart, and resolves each entry by doing
+# a FRESH Outlook COM scan of Sent Items for a matching Subject — the
+# subject already encodes the date, so an exact-text match is unambiguous
+# enough without needing to reason about COM's timezone-aware SentOn vs our
+# naive local timestamps. Deliberately does NOT hold a live win32com object
+# reference across time/threads — COM objects are apartment-threaded and a
+# background thread touching one created on a different thread without
+# careful marshaling is a real crash risk; a fresh Dispatch() per check
+# sidesteps that entirely (same pattern already used by get_outlook_contacts).
+def _load_pending_outlook_sends() -> list:
+    return load_json_list(PENDING_OUTLOOK_SENDS_FILE)
+
+
+def _save_pending_outlook_sends(items: list) -> None:
+    save_json_list(PENDING_OUTLOOK_SENDS_FILE, items)
+
+
+def add_pending_outlook_send(subject: str, category: str) -> None:
+    with _data_lock:
+        items = _load_pending_outlook_sends()
+        items.append(
+            {
+                "id": uuid.uuid4().hex[:10],
+                "subject": subject,
+                "category": category,
+                "opened_at": datetime.datetime.now().isoformat(timespec="seconds"),
+                "notified_at": None,
+            }
+        )
+        _save_pending_outlook_sends(items)
+
+
+def _outlook_sent_items_has_subject(subject: str, scan_limit: int = 100) -> bool:
+    """Fresh Outlook COM connection; True if Sent Items contains an exact
+    Subject match within the most recent `scan_limit` messages. Never
+    raises — callers must treat an exception (Outlook not running, COM
+    apartment issue) as "can't confirm yet", not "definitely unsent"."""
+    import win32com.client
+
+    outlook = win32com.client.Dispatch("Outlook.Application")
+    ns = outlook.GetNamespace("MAPI")
+    sent = ns.GetDefaultFolder(5)  # olFolderSentMail
+    items = sent.Items
+    items.Sort("[SentOn]", True)
+    checked = 0
+    for it in items:
+        if checked >= scan_limit:
+            break
+        checked += 1
+        try:
+            if (it.Subject or "") == subject:
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def resolve_pending_outlook_sends() -> list:
+    """Checks every tracked item against Sent Items; drops the ones
+    confirmed sent. Returns the remaining (still-unsent) entries. Safe to
+    call often — no-ops immediately if nothing is pending, so it doesn't
+    wake/touch Outlook at all when there's nothing to check."""
+    with _data_lock:
+        items = _load_pending_outlook_sends()
+        if not items:
+            return []
+        try:
+            remaining = [it for it in items if not _outlook_sent_items_has_subject(it["subject"])]
+        except Exception:
+            # Outlook COM unavailable right now (e.g. Outlook still starting
+            # up) — don't drop anything, just report the unchanged list.
+            return items
+        if len(remaining) != len(items):
+            _save_pending_outlook_sends(remaining)
+        return remaining
+
+
+class OutlookSendGuard:
+    """Outlook Application.ItemSend event sink — a hard stop, not just a
+    notification. If a MailItem being sent (whether the human clicked Send
+    in the UI, or anything else triggered it) matches a Subject this app
+    opened as a draft on an EARLIER calendar day than today, the send is
+    CANCELLED and a warning box is shown. Content in the leave-notice /
+    Standby categories bakes in "today's date" at open-time, so a draft that
+    survived past midnight is guaranteed stale — this is what actually
+    stops the exact 2026-08-21 incident from recurring, rather than just
+    nagging about it.
+
+    Matches purely by exact Subject text against pending_outlook_sends.json
+    — never touches or delays any email this app didn't open (ordinary
+    personal/business mail sent through Outlook is completely unaffected).
+
+    Registered via win32com.client.DispatchWithEvents, which requires a
+    live Windows message pump on the SAME thread that created this object
+    (see watch_pending_sends / run_outlook_send_guard) to actually receive
+    the callback — it will silently never fire without one."""
+
+    def OnItemSend(self, Item, Cancel):
+        try:
+            subject = Item.Subject or ""
+        except Exception:
+            return
+        try:
+            items = _load_pending_outlook_sends()
+        except Exception:
+            return
+        entry = next((it for it in items if it.get("subject") == subject), None)
+        if not entry:
+            return  # not something this app opened — never interfere
+        try:
+            opened_date = datetime.datetime.fromisoformat(entry["opened_at"]).date()
+        except Exception:
+            return
+        if opened_date >= datetime.date.today():
+            return  # opened today (or somehow in the future) — fine, let it send
+        try:
+            Cancel[0] = True
+        except Exception:
+            pass
+        # Belt-and-suspenders: live-tested (2026-08-21) that Cancel=True alone
+        # is NOT reliably permanent — a cancelled item sent via a headless
+        # mail.Send() call (no Display() first) was observed to actually go
+        # out ~10 minutes later, apparently flushed by an unrelated later
+        # Send/Receive cycle. Clearing every recipient means that even if
+        # Outlook resurrects and resends this exact item later, it has
+        # nobody to deliver to — this is the guarantee that actually matters,
+        # independent of whatever Outlook's Cancel-handling quirk turns out
+        # to be.
+        try:
+            Item.To = ""
+            Item.CC = ""
+            Item.BCC = ""
+            Item.Save()
+        except Exception:
+            pass
+        try:
+            import win32api
+
+            win32api.MessageBox(
+                0,
+                "ฉบับร่างนี้เปิดค้างไว้ตั้งแต่วันที่ "
+                f"{opened_date.strftime('%d/%m/%Y')} ซึ่งไม่ใช่วันนี้แล้ว "
+                "เนื้อหา (วันที่ที่อ้างถึง) จะไม่ตรงกับความเป็นจริง\n\n"
+                "ระบบได้ยกเลิกการส่งฉบับนี้ไว้ก่อนแล้ว — กรุณาปิดร่างนี้ทิ้ง (Discard, "
+                "ไม่ใช่ Save) แล้วเปิดฉบับใหม่จากโปรแกรม OverAll Uploader แทนครับ",
+                "ห้ามส่ง — ร่างนี้ข้ามวันไปแล้ว",
+                0x30,  # MB_ICONWARNING
+            )
+        except Exception:
+            pass
+
+
+def apply_body_keeping_signature(mail, body: str) -> None:
+    """Set a new Outlook MailItem's body, adding a signature. Two sources,
+    tried in order:
+    1. This app's own configured signature (Settings → ลายเซ็นดิจิทัล) — the
+       user explicitly wants THIS exact styled card, not just "whatever's in
+       Outlook". Editable per-machine, never hardcoded to one person, since
+       this app runs under whoever's Windows session is active.
+    2. If no signature is configured here, fall back to preserving whatever
+       Outlook itself would have auto-inserted for a new message (Outlook
+       only populates that into HTMLBody once an Inspector exists for the
+       item, so GetInspector is accessed to force that before reading it).
+    """
+    own_signature_html = build_signature_html()
+    if own_signature_html:
+        body_html = html.escape(body).replace("\n", "<br>\n")
+        mail.HTMLBody = (
+            "<html><body style=\"font-family:'Leelawadee UI','Segoe UI',Tahoma,Arial,sans-serif;font-size:13px;\">"
+            + body_html + "<br><br>" + own_signature_html + "</body></html>"
+        )
+        return
+
+    try:
+        mail.GetInspector  # noqa: B018 — property access has the side effect of creating the Inspector
+        existing_html = mail.HTMLBody or ""
+        match = re.search(r"<body[^>]*>", existing_html, re.IGNORECASE)
+        if match:
+            body_html = html.escape(body).replace("\n", "<br>\n")
+            insert_at = match.end()
+            mail.HTMLBody = existing_html[:insert_at] + body_html + "<br><br>" + existing_html[insert_at:]
+            return
+    except Exception:
+        pass
+    # No signature detected (or anything above failed) — behave exactly as before.
+    mail.Body = body
+
+
+class Api:
+    def get_defaults(self):
+        step1_file = latest_pdf(folder_step1())
+        step3_file = latest_pdf(folder_step3())
+        return {
+            "general_subject": "แจ้งเตือนการดูแลระบบ IT",
+            "general_body": default_general_body(),
+            "step1_file": os.path.basename(step1_file) if step1_file else "ไม่พบไฟล์ PDF",
+            "step3_file": os.path.basename(step3_file) if step3_file else "ไม่พบไฟล์ PDF",
+            "outlook_leave_subject": default_standby_subject(),
+            "outlook_leave_body": default_general_body(),
+        }
+
+    def open_general(self, to_addr, cc_addr, subject, body, image_path=None):
+        return self._compose_thunderbird(
+            to_addr, cc_addr, subject, body, None, "แจ้งเตือนทั่วไป",
+            extra_attachments=[image_path] if image_path else None,
+        )
+
+    def open_outlook_leave(self, to_addr, cc_addr, subject, body, image_path=None):
+        return self._compose_outlook(
+            to_addr, cc_addr, subject, body, "Outlook - แจ้งเลิกงาน",
+            attachments=[image_path] if image_path else None,
+        )
+
+    def get_categories(self):
+        return load_categories()
+
+    def add_category(self, name, badge, description, client, to_addr, cc_addr):
+        name = (name or "").strip()
+        if not name:
+            return {"error": "กรุณาตั้งชื่อหมวดหมู่"}
+        badge = (badge or name[:2]).strip().upper()[:3]
+        category = {
+            "id": f"custom-{uuid.uuid4().hex[:8]}",
+            "name": name,
+            "badge": badge,
+            "description": (description or "").strip(),
+            "client": client if client in ("thunderbird", "outlook") else "thunderbird",
+            "to": (to_addr or "").strip(),
+            "cc": (cc_addr or "").strip(),
+        }
+        with _data_lock:
+            categories = load_categories()
+            categories.append(category)
+            save_categories(categories)
+        return {"category": category}
+
+    def update_category(self, category_id, name, badge, description, client, to_addr, cc_addr):
+        name = (name or "").strip()
+        if not name:
+            return {"error": "กรุณาตั้งชื่อหมวดหมู่"}
+        with _data_lock:
+            categories = load_categories()
+            category = next((c for c in categories if c["id"] == category_id), None)
+            if not category:
+                return {"error": "ไม่พบหมวดหมู่นี้"}
+            category["name"] = name
+            category["badge"] = (badge or name[:2]).strip().upper()[:3]
+            category["description"] = (description or "").strip()
+            category["client"] = client if client in ("thunderbird", "outlook") else category["client"]
+            category["to"] = (to_addr or "").strip()
+            category["cc"] = (cc_addr or "").strip()
+            save_categories(categories)
+        return {"category": category}
+
+    def delete_category(self, category_id):
+        with _data_lock:
+            categories = load_categories()
+            categories = [c for c in categories if c["id"] != category_id]
+            save_categories(categories)
+        return {"ok": True}
+
+    def open_custom(self, category_id, subject, body, to_addr=None, cc_addr=None, image_path=None):
+        categories = load_categories()
+        category = next((c for c in categories if c["id"] == category_id), None)
+        if not category:
+            return {"ok": False, "message": "ไม่พบหมวดหมู่นี้"}
+        final_to = to_addr if to_addr else category["to"]
+        final_cc = cc_addr if cc_addr else category["cc"]
+        label = f"หมวดหมู่ - {category['name']}"
+        if category["client"] == "outlook":
+            return self._compose_outlook(
+                final_to, final_cc, subject, body, label,
+                attachments=[image_path] if image_path else None,
+            )
+        return self._compose_thunderbird(
+            final_to, final_cc, subject, body, None, label,
+            extra_attachments=[image_path] if image_path else None,
+        )
+
+    def pick_file(self):
+        window = webview.windows[0]
+        root = vendor_root()
+        result = window.create_file_dialog(
+            FileDialog.OPEN,
+            directory=root,
+            allow_multiple=False,
+            file_types=("PDF Files (*.pdf)", "All files (*.*)"),
+        )
+        if not result:
+            return None
+        chosen = result[0]
+        # เลือกได้เฉพาะไฟล์ในโซนใบเสนอราคานี้เท่านั้น
+        root_abs = os.path.abspath(root)
+        if os.path.commonpath([root_abs, os.path.abspath(chosen)]) != root_abs:
+            return {"error": "กรุณาเลือกไฟล์ภายในโฟลเดอร์ใบเสนอราคานี้เท่านั้น"}
+        return {"path": chosen, "file_name": os.path.basename(chosen)}
+
+    def pick_image_file(self):
+        window = webview.windows[0]
+        result = window.create_file_dialog(
+            FileDialog.OPEN,
+            allow_multiple=False,
+            file_types=("Image Files (*.png;*.jpg;*.jpeg;*.gif;*.bmp;*.webp)", "All files (*.*)"),
+        )
+        if not result:
+            return None
+        chosen = result[0]
+        return {"path": chosen, "file_name": os.path.basename(chosen)}
+
+    def open_step1(self, quote_no, override_path=None, image_path=None):
+        file_path = override_path or latest_pdf(folder_step1())
+        if not file_path:
+            return {"ok": False, "message": "ไม่พบไฟล์ PDF ในโฟลเดอร์ขั้น 1"}
+
+        if not quote_no:
+            quote_no = find_number_in_file(file_path, QUOTE_NUMBER_RE)
+
+        result = self._compose_thunderbird(
+            vendor_to(), vendor_cc(), "ขอจัดทำใบเสนอราคา", step1_body(quote_no), file_path, "Vendor - ขอใบเสนอราคา",
+            extra_attachments=[image_path] if image_path else None,
+        )
+        result["quote_no"] = quote_no
+        result["file_name"] = os.path.basename(file_path)
+        return result
+
+    def open_step2(self, po_no, override_path=None, image_path=None):
+        file_path = override_path or latest_pdf(folder_step3())
+        if not file_path:
+            return {"ok": False, "message": "ไม่พบไฟล์ PDF ในโฟลเดอร์ขั้น 3"}
+
+        if not po_no:
+            po_no = find_number_in_file(file_path, PO_NUMBER_RE)
+
+        validation_error = validate_recipients("", vendor_cc())
+        if validation_error:
+            return {"ok": False, "message": validation_error}
+
+        subject = f"Re: ใบเสนอราคา [{po_no}] อนุมัติแล้ว - ขอความกรุณาจัดส่งสินค้า"
+        body = step2_body(po_no)
+        attachment_paths = [file_path] + ([image_path] if image_path else [])
+
+        # Try a REAL threaded reply first (Thunderbird extension + native
+        # messaging bridge — see thunderbird_extension/ and SKILL.md). The
+        # original quotation email's body has the bare "QC..." number, not
+        # our "PO-QC..." form, so strip the prefix before searching for it.
+        bridge_result = None
+        if po_no:
+            search_text = po_no.replace("PO-", "").strip()
+            if search_text:
+                bridge_result = try_bridge_action(search_text, vendor_cc(), body, attachment_paths)
+
+        if bridge_result and bridge_result.get("ok"):
+            result = {
+                "ok": True,
+                "message": f"เปิด Reply จริงบนอีเมลเดิมแล้ว (หัวข้อเดิม: {bridge_result.get('originalSubject', '-')}) กรุณาตรวจสอบก่อนกดส่ง",
+            }
+            append_send_log(
+                {
+                    "client": "thunderbird",
+                    "category": "Vendor - อนุมัติ+จัดส่ง (reply)",
+                    "to": "",
+                    "cc": vendor_cc(),
+                    "subject": subject,
+                    "body": body,
+                    "attachment": os.path.basename(file_path),
+                    "status": "opened (reply)",
+                }
+            )
+        else:
+            result = self._compose_thunderbird(
+                vendor_to(), vendor_cc(), subject, body, file_path, "Vendor - อนุมัติ+จัดส่ง",
+                extra_attachments=[image_path] if image_path else None,
+            )
+            if is_reply_bridge_registered():
+                # bridge is set up but didn't find/answer in time — say so instead of pretending nothing was tried
+                note = bridge_result.get("error") if bridge_result else "ไม่ตอบสนองภายในเวลาที่กำหนด"
+                result["message"] = result.get("message", "") + f" (หมายเหตุ: ลอง reply จริงก่อนแล้วแต่ไม่สำเร็จ — {note} จึงเปิดฉบับร่างใหม่แทน)"
+
+        result["po_no"] = po_no
+        result["file_name"] = os.path.basename(file_path)
+
+        if result.get("ok"):
+            # Copying (not moving — see archive_pr_po_file's docstring), so
+            # there's no race with Thunderbird still reading the original
+            # for the attachment; no artificial delay needed here anymore.
+            archive_result = archive_pr_po_file(file_path, po_no)
+            result["archive_ok"] = archive_result["ok"]
+            result["message"] = result["message"] + " " + archive_result["message"]
+
+        return result
+
+    def _compose_thunderbird(self, to_addr, cc_addr, subject, body, attachment, category_label="แจ้งเตือนทั่วไป", extra_attachments=None):
+        validation_error = validate_recipients(to_addr, cc_addr)
+        if validation_error:
+            return {"ok": False, "message": validation_error}
+        try:
+            thunderbird = find_thunderbird()
+
+            all_attachments = ([attachment] if attachment else []) + list(extra_attachments or [])
+
+            fields = []
+            if to_addr:
+                fields.append(f"to='{escape_field(to_addr)}'")
+            if cc_addr:
+                fields.append(f"cc='{escape_field(cc_addr)}'")
+            fields.append(f"subject='{escape_field(subject)}'")
+            # Always plain text for Thunderbird's -compose. An HTML body
+            # (tried to inject the digital-signature card here) reliably
+            # broke in real testing: Thunderbird's compose editor either
+            # dropped the content entirely or re-wrapped every line in its
+            # own default-margin <p>, giving huge gaps between every single
+            # line no matter how the HTML was structured. Plain text has
+            # neither problem and renders \n / \n\n exactly as written.
+            fields.append(f"body='{escape_field(body)}'")
+            if all_attachments:
+                # Thunderbird's -compose accepts a comma-separated list of file:// URIs
+                # in a single attachment='...' value.
+                uris = [
+                    "file:///" + os.path.abspath(path).replace("\\", "/")
+                    for path in all_attachments
+                ]
+                fields.append(f"attachment='{escape_field(','.join(uris))}'")
+            compose_arg = ",".join(fields)
+
+            subprocess.Popen([thunderbird, "-compose", compose_arg])
+            append_send_log(
+                {
+                    "client": "thunderbird",
+                    "category": category_label,
+                    "to": to_addr or "",
+                    "cc": cc_addr or "",
+                    "subject": subject or "",
+                    "body": body or "",
+                    "attachment": ", ".join(os.path.basename(p) for p in all_attachments),
+                    "status": "opened",
+                }
+            )
+            return {"ok": True, "message": "เปิดฉบับร่างใน Thunderbird แล้ว กรุณาตรวจสอบก่อนกดส่ง"}
+        except Exception as exc:
+            return {"ok": False, "message": f"เกิดข้อผิดพลาด: {exc} — ตรวจสอบว่าติดตั้ง Thunderbird ไว้ที่เครื่องนี้แล้ว"}
+
+    def _compose_outlook(self, to_addr, cc_addr, subject, body, category_label="Outlook", attachments=None):
+        # NOTE: this method ONLY ever opens a draft (mail.Display()) — it
+        # never calls mail.Send(). The scheduled/deferred auto-send path
+        # (DeferredDeliveryTime + Send) was removed on purpose: it was the
+        # only place the app could send an email without a human clicking
+        # Send, and a draft left over from a previous day silently went out
+        # to the whole distribution list once. Do NOT reintroduce an
+        # auto-send path here.
+        validation_error = validate_recipients(to_addr, cc_addr)
+        if validation_error:
+            return {"ok": False, "message": validation_error}
+        try:
+            import win32com.client
+
+            outlook = win32com.client.Dispatch("Outlook.Application")
+            mail = outlook.CreateItem(0)  # olMailItem
+            if to_addr:
+                mail.To = to_addr
+            if cc_addr:
+                mail.CC = cc_addr
+            mail.Subject = subject
+            apply_body_keeping_signature(mail, body)
+            for path in attachments or []:
+                if path and os.path.isfile(path):
+                    mail.Attachments.Add(os.path.abspath(path))
+
+            mail.Display()
+            append_send_log(
+                {
+                    "client": "outlook",
+                    "category": category_label,
+                    "to": to_addr or "",
+                    "cc": cc_addr or "",
+                    "subject": subject or "",
+                    "body": body or "",
+                    "attachment": ", ".join(os.path.basename(p) for p in (attachments or []) if p),
+                    "status": "opened",
+                }
+            )
+            add_pending_outlook_send(subject or "", category_label)
+            return {"ok": True, "message": "เปิดฉบับร่างใน Outlook แล้ว กรุณาตรวจสอบก่อนกดส่ง"}
+        except Exception as exc:
+            return {"ok": False, "message": f"เกิดข้อผิดพลาด: {exc} — ตรวจสอบว่าเปิดโปรแกรม Outlook ไว้แล้ว"}
+
+    def get_send_log(self, limit=100):
+        return load_json_list(SEND_LOG_FILE)[:limit]
+
+    def clear_history(self):
+        with _data_lock:
+            save_json_list(SEND_LOG_FILE, [])
+        return {"ok": True}
+
+    def export_history_csv(self):
+        logs = load_json_list(SEND_LOG_FILE)
+        if not logs:
+            return {"ok": False, "message": "ไม่มีประวัติให้ส่งออก"}
+        window = webview.windows[0]
+        default_name = f"ประวัติการส่ง-{datetime.date.today().isoformat()}.csv"
+        result = window.create_file_dialog(
+            FileDialog.SAVE,
+            directory=os.path.join(os.path.expanduser("~"), "Desktop"),
+            save_filename=default_name,
+            file_types=("CSV Files (*.csv)", "All files (*.*)"),
+        )
+        if not result:
+            return {"ok": False, "message": "ยกเลิกการส่งออก"}
+        path = result if isinstance(result, str) else result[0]
+        buf = io.StringIO()
+        writer = csv.writer(buf)
+        writer.writerow(["เวลา", "หมวดหมู่", "ช่องทาง", "ถึง", "สำเนา", "หัวข้อ", "สถานะ", "ไฟล์แนบ"])
+        for entry in logs:
+            writer.writerow(
+                [
+                    entry.get("timestamp", ""),
+                    entry.get("category", ""),
+                    entry.get("client", ""),
+                    entry.get("to", ""),
+                    entry.get("cc", ""),
+                    entry.get("subject", ""),
+                    entry.get("status", ""),
+                    entry.get("attachment", ""),
+                ]
+            )
+        with open(path, "w", encoding="utf-8-sig", newline="") as f:
+            f.write(buf.getvalue())
+        return {"ok": True, "message": f"ส่งออกประวัติแล้วที่ {path}"}
+
+    def resend_log(self, log_id):
+        logs = load_json_list(SEND_LOG_FILE)
+        entry = next((l for l in logs if l["id"] == log_id), None)
+        if not entry:
+            return {"ok": False, "message": "ไม่พบประวัตินี้"}
+        label = entry.get("category", "ส่งซ้ำจากประวัติ")
+        if entry.get("client") == "outlook":
+            return self._compose_outlook(entry.get("to", ""), entry.get("cc", ""), entry.get("subject", ""), entry.get("body", ""), label)
+        return self._compose_thunderbird(entry.get("to", ""), entry.get("cc", ""), entry.get("subject", ""), entry.get("body", ""), None, label)
+
+    def check_environment(self):
+        warnings = []
+        try:
+            find_thunderbird()
+        except FileNotFoundError:
+            warnings.append("ไม่พบโปรแกรม Thunderbird ในเครื่องนี้ — หมวดหมู่ที่เปิดร่างด้วย Thunderbird จะใช้งานไม่ได้")
+        if not is_outlook_installed():
+            warnings.append("ไม่พบโปรแกรม Outlook ในเครื่องนี้ — หมวดหมู่ที่เปิดร่างด้วย Outlook จะใช้งานไม่ได้")
+        if not os.path.isdir(vendor_root()):
+            warnings.append("ไม่พบโฟลเดอร์ใบเสนอราคา Vendor ตามที่ตั้งค่าไว้ — ตรวจสอบตำแหน่งโฟลเดอร์ในหน้าตั้งค่า")
+        return {"warnings": warnings}
+
+    def get_fg_stock_status(self):
+        log_tail = []
+        if os.path.isfile(FG_STOCK_LOG_FILE):
+            try:
+                with open(FG_STOCK_LOG_FILE, "r", encoding="utf-8") as f:
+                    log_tail = [line.strip() for line in f.readlines()[-15:]]
+                log_tail.reverse()
+            except Exception:
+                pass
+
+        last_success = ""
+        if os.path.isfile(FG_STOCK_LAST_SUCCESS_FILE):
+            try:
+                with open(FG_STOCK_LAST_SUCCESS_FILE, "r", encoding="utf-8") as f:
+                    last_success = f.read().strip()
+            except Exception:
+                pass
+
+        return {
+            "installed": os.path.isfile(FG_STOCK_LAUNCHER),
+            "log_tail": log_tail,
+            "last_success": last_success,
+            "today_ok": last_success == datetime.date.today().isoformat(),
+            "startup_shortcut": os.path.isfile(FG_STOCK_STARTUP_SHORTCUT),
+            "task": fg_stock_task_info(),
+        }
+
+    def run_fg_stock_now(self):
+        if not os.path.isfile(FG_STOCK_LAUNCHER):
+            return {"ok": False, "message": "ไม่พบโปรแกรม Auto FG Stock Importer ในเครื่องนี้"}
+        try:
+            subprocess.run(
+                ["cmd", "/c", FG_STOCK_LAUNCHER],
+                capture_output=True, text=True, timeout=90,
+            )
+            return {"ok": True, "message": "รันคำสั่งดึงข้อมูล FG Stock เสร็จแล้ว ตรวจผลลัพธ์ด้านล่าง"}
+        except subprocess.TimeoutExpired:
+            return {"ok": False, "message": "รันนานเกินไป (เกิน 90 วินาที) — เครือข่ายหรือฐานข้อมูลอาจช้าหรือไม่ตอบสนอง"}
+        except Exception as exc:
+            return {"ok": False, "message": f"รันไม่สำเร็จ: {exc}"}
+
+    def open_fg_stock_folder(self):
+        folder = fg_stock_today_folder()
+        if not folder:
+            return {"ok": False, "message": "ไม่พบการตั้งค่าโฟลเดอร์ปลายทางของ Auto FG Stock Importer"}
+        if not os.path.isdir(folder):
+            return {"ok": False, "message": f"ยังไม่มีโฟลเดอร์ของเดือนนี้ (ยังไม่เคย export): {folder}"}
+        try:
+            os.startfile(folder)
+            return {"ok": True, "message": "เปิดโฟลเดอร์แล้ว"}
+        except Exception as exc:
+            return {"ok": False, "message": f"เปิดโฟลเดอร์ไม่สำเร็จ: {exc}"}
+
+    def get_step3_autorename(self):
+        return {
+            "enabled": step3_autorename_enabled(),
+            "tesseract": bool(tesseract_path()),
+            "folder": folder_step3(),
+        }
+
+    def set_step3_autorename(self, enabled):
+        with _data_lock:
+            save_config({"step3_autorename": bool(enabled)})
+        return {"ok": True, "enabled": step3_autorename_enabled()}
+
+    def get_step3_rename_log(self, limit=30):
+        return load_json_list(STEP3_RENAME_LOG_FILE)[:limit]
+
+    def sweep_step3_now(self):
+        if not tesseract_path():
+            return {"ok": False, "message": "ไม่พบโปรแกรม OCR (Tesseract) ในเครื่องนี้ — ฟีเจอร์นี้ใช้ไม่ได้"}
+        summary = sweep_step3_folder()
+        parts = []
+        if summary["renamed"]:
+            parts.append(f"เปลี่ยนชื่อ {summary['renamed']} ไฟล์")
+        if summary["collision"]:
+            parts.append(f"ข้ามเพราะชื่อซ้ำ {summary['collision']}")
+        if summary["unreadable"]:
+            parts.append(f"อ่านไม่ออก {summary['unreadable']}")
+        if summary["error"]:
+            parts.append(f"ผิดพลาด {summary['error']}")
+        msg = "สแกนเสร็จแล้ว — " + (", ".join(parts) if parts else f"ชื่อถูกต้องอยู่แล้วทั้งหมด ({summary['already_named']} ไฟล์)")
+        return {"ok": True, "message": msg, "summary": summary}
+
+    def get_pending_outlook_sends(self):
+        return resolve_pending_outlook_sends()
+
+    def get_vendor_config(self):
+        return load_config()
+
+    def save_vendor_config(self, to_addr, cc_addr, root_folder):
+        root_folder = (root_folder or "").strip()
+        if not root_folder:
+            return {"error": "กรุณาระบุโฟลเดอร์ใบเสนอราคาหลัก"}
+        validation_error = validate_recipients(to_addr, cc_addr)
+        if validation_error:
+            return {"error": validation_error}
+        with _data_lock:
+            save_config(
+                {
+                    "vendor_to": (to_addr or "").strip(),
+                    "vendor_cc": (cc_addr or "").strip(),
+                    "vendor_root": root_folder,
+                }
+            )
+        return {"ok": True, "config": load_config()}
+
+    def get_signature_config(self):
+        return signature_config()
+
+    def save_signature_config(self, name, position, email, it_call):
+        with _data_lock:
+            save_config(
+                {
+                    "sig_name": (name or "").strip(),
+                    "sig_position": (position or "").strip(),
+                    "sig_email": (email or "").strip(),
+                    "sig_it_call": (it_call or "").strip(),
+                }
+            )
+        return {"ok": True, "config": signature_config()}
+
+    def preview_signature_html(self):
+        return {"html": build_signature_html()}
+
+    def pick_vendor_root_folder(self):
+        window = webview.windows[0]
+        result = window.create_file_dialog(FileDialog.FOLDER, directory=vendor_root())
+        if not result:
+            return None
+        return {"path": result[0] if isinstance(result, (list, tuple)) else result}
+
+    def get_app_info(self):
+        return {
+            "version": APP_VERSION,
+            "build_date": APP_BUILD_DATE,
+            "author": "Purinat Lexuthai",
+            "company": "Example Company Co., Ltd.",
+        }
+
+    def get_autostart(self):
+        return {"enabled": os.path.isfile(startup_shortcut_path())}
+
+    def set_autostart(self, enabled):
+        path = startup_shortcut_path()
+        if enabled:
+            try:
+                import win32com.client
+
+                shell = win32com.client.Dispatch("WScript.Shell")
+                shortcut = shell.CreateShortcut(path)
+                if getattr(sys, "frozen", False):
+                    shortcut.TargetPath = sys.executable
+                    shortcut.IconLocation = sys.executable
+                else:
+                    shortcut.TargetPath = python_executable_for_shortcut()
+                    shortcut.Arguments = f'"{os.path.join(APP_DIR, "mail_app.py")}"'
+                    icon_path = os.path.join(RESOURCE_DIR, "ui", "app_icon.ico")
+                    if os.path.isfile(icon_path):
+                        shortcut.IconLocation = icon_path
+                shortcut.WorkingDirectory = APP_DIR
+                shortcut.Save()
+                return {"ok": True, "message": "เปิดใช้งานเริ่มแอปอัตโนมัติเมื่อเปิดเครื่องแล้ว"}
+            except Exception as exc:
+                return {"ok": False, "message": f"ตั้งค่าไม่สำเร็จ: {exc}"}
+        else:
+            try:
+                if os.path.isfile(path):
+                    os.remove(path)
+                return {"ok": True, "message": "ปิดการเริ่มแอปอัตโนมัติแล้ว"}
+            except Exception as exc:
+                return {"ok": False, "message": f"ปิดใช้งานไม่สำเร็จ: {exc}"}
+
+    def get_reply_bridge(self):
+        return {"enabled": is_reply_bridge_registered()}
+
+    def set_reply_bridge(self, enabled):
+        if enabled:
+            return register_reply_bridge()
+        return unregister_reply_bridge()
+
+    def get_outlook_contacts(self):
+        try:
+            import win32com.client
+
+            outlook = win32com.client.Dispatch("Outlook.Application")
+            namespace = outlook.GetNamespace("MAPI")
+            contacts_folder = namespace.GetDefaultFolder(10)  # olFolderContacts
+
+            contacts = []
+            seen = set()
+            for item in contacts_folder.Items:
+                try:
+                    if item.Class != 40:  # olContact
+                        continue
+                    email = None
+                    for addr_prop, type_prop in (
+                        ("Email1Address", "Email1AddressType"),
+                        ("Email2Address", "Email2AddressType"),
+                        ("Email3Address", "Email3AddressType"),
+                    ):
+                        addr = getattr(item, addr_prop, None)
+                        if not addr:
+                            continue
+                        if getattr(item, type_prop, None) == "EX":
+                            try:
+                                addr = item.PropertyAccessor.GetProperty(
+                                    "http://schemas.microsoft.com/mapi/proptag/0x39FE001E"
+                                )
+                            except Exception:
+                                addr = None
+                        if addr and "@" in addr:
+                            email = addr
+                            break
+                    if not email or email.lower() in seen:
+                        continue
+                    seen.add(email.lower())
+                    name = item.FullName or item.CompanyName or email
+                    contacts.append({"name": name, "email": email})
+                except Exception:
+                    continue
+
+            contacts.sort(key=lambda c: c["name"].lower())
+            return {"contacts": contacts}
+        except Exception as exc:
+            return {"error": f"ไม่สามารถอ่านสมุดที่อยู่ Outlook ได้: {exc}"}
+
+
+PENDING_SEND_NOTIFY_AFTER_MINUTES = 5
+PENDING_SEND_RENOTIFY_EVERY_MINUTES = 10
+
+
+def run_tray_and_watcher(window, icon_path):
+    """System tray icon (minimize-to-tray) + two watcher threads that run
+    while the app is open: the step-3 folder auto-rename watcher
+    (watch_step3) and the unsent-Outlook-draft nagger (watch_pending_sends,
+    see the "Pending-Outlook-send tracker" block above apply_body_keeping_signature)."""
+    import pystray
+    from PIL import Image
+
+    quitting = {"flag": False}
+
+    def show_window():
+        window.show()
+        window.restore()
+
+    def quit_app(icon_obj, item=None):
+        quitting["flag"] = True
+        icon_obj.stop()
+        window.destroy()
+
+    def on_closing():
+        if quitting["flag"]:
+            return None
+        window.hide()
+        return False
+
+    window.events.closing += on_closing
+
+    try:
+        image = Image.open(icon_path)
+    except Exception:
+        image = Image.new("RGBA", (32, 32), (22, 49, 79, 255))
+
+    menu = pystray.Menu(
+        pystray.MenuItem("เปิดแอป", lambda: show_window(), default=True),
+        pystray.MenuItem("ออกจากโปรแกรม", quit_app),
+    )
+    tray_icon = pystray.Icon("mail_composer", image, "OverAll Uploader", menu)
+
+    def watch_step3():
+        """Poll the step-3 folder ~every 2s and auto-rename new/changed PDFs
+        to PO-QC<number>.pdf (number OCR'd from the scan — see
+        process_step3_file). The first loop with an empty `seen` set is the
+        startup sweep; after that only new/changed files are OCR'd, and the
+        `seen` map is persisted so a growing folder doesn't re-OCR every file
+        on every launch. Notifies via the tray on each actual rename."""
+        # seen: {path: [mtime, size]} of files already resolved this + prior runs
+        try:
+            with open(STEP3_SEEN_FILE, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+            seen = {k: tuple(v) for k, v in loaded.items()} if isinstance(loaded, dict) else {}
+        except Exception:
+            seen = {}
+
+        while not quitting["flag"]:
+            dirty = False
+            try:
+                if step3_autorename_enabled() and tesseract_path():
+                    folder = folder_step3()
+                    try:
+                        names = os.listdir(folder)
+                    except OSError:
+                        names = []
+                    pdfs = {n for n in names if n.lower().endswith(".pdf")}
+                    present_paths = {os.path.join(folder, n) for n in pdfs}
+                    # drop remembered files that no longer exist (keeps the map bounded)
+                    for stale in [p for p in seen if p not in present_paths]:
+                        seen.pop(stale, None)
+                        dirty = True
+                    for name in sorted(pdfs):
+                        if quitting["flag"]:
+                            break
+                        path = os.path.join(folder, name)
+                        try:
+                            st = os.stat(path)
+                        except OSError:
+                            continue
+                        # still being written/copied — let it settle first
+                        if time.time() - st.st_mtime < 2.0:
+                            continue
+                        sig = (st.st_mtime, st.st_size)
+                        if seen.get(path) == sig:
+                            continue
+                        result = process_step3_file(path)
+                        if result.get("action") == "renamed":
+                            seen.pop(path, None)
+                            newpath = os.path.join(folder, result["target"])
+                            try:
+                                nst = os.stat(newpath)
+                                seen[newpath] = (nst.st_mtime, nst.st_size)
+                            except OSError:
+                                pass
+                            append_step3_rename_log(result)
+                            try:
+                                tray_icon.notify(
+                                    f"{result['file']}  →  {result['target']}",
+                                    "เปลี่ยนชื่อไฟล์ขั้น 3 อัตโนมัติแล้ว",
+                                )
+                            except Exception:
+                                pass
+                        else:
+                            seen[path] = sig
+                            if result.get("reason") == "collision" or result.get("action") == "error":
+                                append_step3_rename_log(result)
+                        dirty = True
+                if dirty:
+                    try:
+                        with open(STEP3_SEEN_FILE, "w", encoding="utf-8") as f:
+                            json.dump({k: list(v) for k, v in seen.items()}, f)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            for _ in range(2):
+                if quitting["flag"]:
+                    break
+                threading.Event().wait(1)
+
+    def watch_pending_sends():
+        """Polls every 30s for Outlook drafts that were opened via the app
+        but never confirmed sent. Fires a tray notification once a draft has
+        sat unsent for PENDING_SEND_NOTIFY_AFTER_MINUTES, and repeats every
+        PENDING_SEND_RENOTIFY_EVERY_MINUTES after that, so it keeps nagging
+        instead of a single notification the user can miss.
+        Runs on its own OS thread — COM (Outlook automation) is
+        apartment-threaded, so this thread must CoInitialize itself before
+        touching Outlook; resolve_pending_outlook_sends() creates a fresh
+        win32com Dispatch() per check rather than sharing an object with any
+        other thread, which is what actually makes this safe."""
+        import pythoncom
+
+        pythoncom.CoInitialize()
+        try:
+            while not quitting["flag"]:
+                try:
+                    items = resolve_pending_outlook_sends()
+                    if items:
+                        now = datetime.datetime.now()
+                        dirty = False
+                        for entry in items:
+                            try:
+                                opened_at = datetime.datetime.fromisoformat(entry["opened_at"])
+                            except Exception:
+                                continue
+                            notified_at = entry.get("notified_at")
+                            last_notified = None
+                            if notified_at:
+                                try:
+                                    last_notified = datetime.datetime.fromisoformat(notified_at)
+                                except Exception:
+                                    last_notified = None
+                            should_notify = False
+                            if last_notified is None:
+                                if (now - opened_at).total_seconds() >= PENDING_SEND_NOTIFY_AFTER_MINUTES * 60:
+                                    should_notify = True
+                            elif (now - last_notified).total_seconds() >= PENDING_SEND_RENOTIFY_EVERY_MINUTES * 60:
+                                should_notify = True
+                            if should_notify:
+                                try:
+                                    tray_icon.notify(
+                                        f"{entry.get('subject') or '(ไม่มีหัวข้อ)'} — ยังไม่ได้กด Send ใน Outlook",
+                                        "ยังไม่ได้ส่งอีเมล!",
+                                    )
+                                except Exception:
+                                    pass
+                                entry["notified_at"] = now.isoformat(timespec="seconds")
+                                dirty = True
+                        if dirty:
+                            with _data_lock:
+                                _save_pending_outlook_sends(items)
+                except Exception:
+                    pass
+                for _ in range(30):
+                    if quitting["flag"]:
+                        break
+                    threading.Event().wait(1)
+        finally:
+            pythoncom.CoUninitialize()
+
+    def run_outlook_send_guard():
+        """Registers OutlookSendGuard on the ItemSend event and pumps
+        Windows messages so the callback can actually fire — DispatchWithEvents
+        alone does nothing without a live message pump on this same thread.
+        Keeps a reference to `outlook` for the whole thread lifetime; letting
+        it get garbage-collected would silently drop the event sink."""
+        import pythoncom
+        import win32com.client
+
+        pythoncom.CoInitialize()
+        try:
+            outlook = win32com.client.DispatchWithEvents("Outlook.Application", OutlookSendGuard)
+            while not quitting["flag"]:
+                pythoncom.PumpWaitingMessages()
+                threading.Event().wait(0.2)
+        except Exception:
+            pass
+        finally:
+            pythoncom.CoUninitialize()
+
+    threading.Thread(target=watch_step3, daemon=True).start()
+    threading.Thread(target=watch_pending_sends, daemon=True).start()
+    threading.Thread(target=run_outlook_send_guard, daemon=True).start()
+    tray_icon.run_detached()
+    return tray_icon
+
+
+if __name__ == "__main__":
+    if "--reply-bridge-host" in sys.argv:
+        run_reply_bridge_host()
+        sys.exit(0)
+
+    ui_dir = os.path.join(RESOURCE_DIR, "ui")
+    icon_path = os.path.join(ui_dir, "app_icon.ico")
+    window = webview.create_window(
+        "OverAll Uploader",
+        url=os.path.join(ui_dir, "index.html"),
+        js_api=Api(),
+        width=1180,
+        height=760,
+        min_size=(960, 600),
+        background_color="#e7ecf7",
+    )
+
+    def _setup_tray():
+        if os.path.isfile(icon_path):
+            try:
+                run_tray_and_watcher(window, icon_path)
+            except Exception:
+                pass
+
+    webview.start(_setup_tray, icon=icon_path if os.path.isfile(icon_path) else None)
